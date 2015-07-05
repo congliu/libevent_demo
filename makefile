@@ -1,5 +1,9 @@
 CC=g++
-EXE=simple_echo
+EXE=simple_echo \
+	http_demo	\
+	buffer_event_demo
+
+CFLAG+=-g
 CFLAG+=-levent
 
 all: $(EXE)
