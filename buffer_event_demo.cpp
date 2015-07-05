@@ -1,157 +1,99 @@
-#include <event.h>
-#include <sys/types.h>
+#include <event2/event.h>
+#include <event2/bufferevent.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
 
-#define SERVER_PORT 8080
-int debug = 0;
+#include <event2/buffer.h>
+#include <event2/util.h>
 
-struct client {
-  int fd;
-  struct bufferevent *buf_ev;
+#define MAX_BUF 1024
+struct Client
+{
+    char writeBuf[MAX_BUF];
+    char readBuf[MAX_BUF];
 };
 
-int setnonblock(int fd)
+void readcb(struct bufferevent *bev, void *ptr)
 {
-  int flags;
-
-  flags = fcntl(fd, F_GETFL);
-  flags |= O_NONBLOCK;
-  fcntl(fd, F_SETFL, flags);
-  return 0;
-}
-
-void buf_read_callback(struct bufferevent *incoming,
-                       void *arg)
-{
-  struct evbuffer *evreturn;
-  char *req;
-
-  req = evbuffer_readline(incoming->input);
-  if (req == NULL)
-    return;
-
-  evreturn = evbuffer_new();
-  evbuffer_add_printf(evreturn,"You said %s\n",req);
-  bufferevent_write_buffer(incoming,evreturn);
-  evbuffer_free(evreturn);
-  free(req);
-}
-
-void buf_write_callback(struct bufferevent *bev,
-                        void *arg)
-{
-}
-
-void buf_error_callback(struct bufferevent *bev,
-                        short what,
-                        void *arg)
-{
-  struct client *client = (struct client *)arg;
-  bufferevent_free(client->buf_ev);
-  close(client->fd);
-  free(client);
-}
-
-void accept_callback(int fd,
-                     short ev,
-                     void *arg)
-{
-  int client_fd;
-  struct sockaddr_in client_addr;
-  socklen_t client_len = sizeof(client_addr);
-  struct client *client;
-
-  client_fd = accept(fd,
-                     (struct sockaddr *)&client_addr,
-                     &client_len);
-  if (client_fd < 0)
-    {
-      printf("Client: accept() failed\n");
-      return;
+    char buf[1024];
+    Client* cl = (Client*)ptr;
+    int n;
+    struct evbuffer *input = bufferevent_get_input(bev);
+    while ((n = evbuffer_remove(input, cl->readBuf, sizeof(cl->readBuf))) > 0) {
+        fwrite(cl->readBuf, 1, n, stdout);
     }
 
-  setnonblock(client_fd);
-
-  client = (struct client*)calloc(1, sizeof(*client));
-  if (client == NULL)
-    printf("malloc failed\n");
-  client->fd = client_fd;
-
-  client->buf_ev = bufferevent_new(client_fd,
-                                   buf_read_callback,
-                                   buf_write_callback,
-                                   buf_error_callback,
-                                   client);
-
-  bufferevent_enable(client->buf_ev, EV_READ);
+    struct evbuffer* evreturn = evbuffer_new();
+    evbuffer_add_printf(evreturn, "client has got it: %s\n", cl->readBuf);
+    //write buffer
+    bufferevent_write_buffer(bev, evreturn);
+    evbuffer_free(evreturn);
 }
 
-int main(int argc,
-         char **argv)
+void writecb(struct bufferevent *bev, void *ptr)
 {
-  int socketlisten;
-  struct sockaddr_in addresslisten;
-  struct event accept_event;
-  int reuse = 1;
-
-  event_init();
-
-  socketlisten = socket(AF_INET, SOCK_STREAM, 0);
-
-  if (socketlisten < 0)
-    {
-      fprintf(stderr,"Failed to create listen socket");
-      return 1;
+    Client* cl = (Client*)ptr;
+    if(cl->writeBuf[0] == '\0') {
+        //already sent
+        bufferevent_disable(bev, EV_WRITE);
+        return;
     }
 
-  memset(&addresslisten, 0, sizeof(addresslisten));
-
-  addresslisten.sin_family = AF_INET;
-  addresslisten.sin_addr.s_addr = INADDR_ANY;
-  addresslisten.sin_port = htons(SERVER_PORT);
-
-  if (bind(socketlisten,
-           (struct sockaddr *)&addresslisten,
-           sizeof(addresslisten)) < 0)
-    {
-      fprintf(stderr,"Failed to bind");
-      return 1;
-    }
-
-  if (listen(socketlisten, 5) < 0)
-    {
-      fprintf(stderr,"Failed to listen to socket");
-      return 1;
-    }
-
-  setsockopt(socketlisten,
-             SOL_SOCKET,
-             SO_REUSEADDR,
-             &reuse,
-             sizeof(reuse));
-
-  setnonblock(socketlisten);
-
-  event_set(&accept_event,
-            socketlisten,
-            EV_READ|EV_PERSIST,
-            accept_callback,
-            NULL);
-
-  event_add(&accept_event,
-            NULL);
-
-  event_dispatch();
-
-  close(socketlisten);
-
-  return 0;
+    struct evbuffer *output = bufferevent_get_output(bev);
+    //we just set string to output buffer, do need to call bufferevent_write_buffer
+    evbuffer_add(output, cl->writeBuf, strlen(cl->writeBuf)+1);
+    memset(cl->writeBuf, 0, MAX_BUF);
+    //bufferevent_write_buffer(bev, output);
 }
 
+void eventcb(struct bufferevent *bev, short events, void *ptr)
+{
+    if (events & BEV_EVENT_CONNECTED) {
+         /* We're connected to 127.0.0.1:8080.   Ordinarily we'd do
+            something here, like start reading or writing. */
+        printf("connected!\n");
+    } else if (events & BEV_EVENT_ERROR) {
+         /* An error occured while connecting. */
+         printf("Closing\n");
+    }
+}
+
+/*
+server
+echo "abc" | nc -l -p 8080
+*/
+
+
+int main(void)
+{
+    struct event_base *base;
+    struct bufferevent *bev;
+    struct sockaddr_in sin;
+
+    base = event_base_new();
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    //sin.sin_addr.s_addr = INADDR_ANY;
+    sin.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
+    sin.sin_port = htons(8080); /* Port 8080 */
+
+    bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+
+    Client* cl = new Client();
+    memset(cl->readBuf, 0, MAX_BUF);
+    strcpy(cl->writeBuf, "I want to drink coke!\n");
+
+    bufferevent_setcb(bev, readcb, writecb, eventcb, cl);
+    bufferevent_enable(bev, EV_READ|EV_WRITE);
+
+    if (bufferevent_socket_connect(bev,
+        (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        /* Error starting connection */
+        bufferevent_free(bev);
+        return -1;
+    }
+
+    event_base_dispatch(base);
+    return 0;
+}
